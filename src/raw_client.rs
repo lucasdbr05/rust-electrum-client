@@ -37,6 +37,7 @@ use crate::stream::ClonableStream;
 
 use crate::api::ElectrumApi;
 use crate::batch::Batch;
+use crate::config::AuthProvider;
 use crate::types::*;
 
 /// Client name sent to the server during protocol version negotiation.
@@ -132,17 +133,16 @@ impl_to_socket_addrs_domain!((std::net::Ipv6Addr, u16));
 
 /// Instance of an Electrum client
 ///
-/// A `Client` maintains a constant connection with an Electrum server and exposes methods to
-/// interact with it. It can also subscribe and receive notifictations from the server about new
+/// A [`RawClient`] maintains a constant connection with an Electrum server and exposes methods to
+/// interact with it. It can also subscribe and receive notifications from the server about new
 /// blocks or activity on a specific *scriptPubKey*.
 ///
-/// The `Client` is modeled in such a way that allows the external caller to have full control over
+/// The [`RawClient`] is modeled in such a way that allows the external caller to have full control over
 /// its functionality: no threads or tasks are spawned internally to monitor the state of the
 /// connection.
 ///
 /// More transport methods can be used by manually creating an instance of this struct with an
-/// arbitray `S` type.
-#[derive(Debug)]
+/// arbitrary `S` type.
 pub struct RawClient<S>
 where
     S: Read + Write,
@@ -159,7 +159,31 @@ where
     /// The protocol version negotiated with the server via `server.version`.
     protocol_version: Mutex<Option<String>>,
 
+    /// Optional authorization provider for dynamic token injection (e.g., JWT).
+    auth_provider: Option<AuthProvider>,
+
     calls: AtomicUsize,
+}
+
+// Custom Debug impl because AuthProvider doesn't implement Debug
+impl<S> std::fmt::Debug for RawClient<S>
+where
+    S: Read + Write,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawClient")
+            .field("stream", &"<stream>")
+            .field("buf_reader", &"<buf_reader>")
+            .field("last_id", &self.last_id)
+            .field("waiting_map", &self.waiting_map)
+            .field("headers", &self.headers)
+            .field("script_notifications", &self.script_notifications)
+            .field(
+                "auth_provider",
+                &self.auth_provider.as_ref().map(|_| "<provider>"),
+            )
+            .finish()
+    }
 }
 
 impl<S> From<S> for RawClient<S>
@@ -180,6 +204,8 @@ where
             script_notifications: Mutex::new(HashMap::new()),
 
             protocol_version: Mutex::new(None),
+
+            auth_provider: None,
 
             calls: AtomicUsize::new(0),
         }
@@ -207,9 +233,7 @@ impl RawClient<ElectrumPlaintextStream> {
             None => TcpStream::connect(socket_addrs)?,
         };
 
-        let client: Self = stream.into();
-        client.negotiate_protocol_version()?;
-        Ok(client)
+        Ok(stream.into())
     }
 }
 
@@ -293,6 +317,7 @@ impl RawClient<ElectrumSslStream> {
     ) -> Result<Self, Error> {
         let mut builder =
             SslConnector::builder(SslMethod::tls()).map_err(Error::InvalidSslMethod)?;
+
         // TODO: support for certificate pinning
         if validate_domain {
             socket_addrs.domain().ok_or(Error::MissingDomain)?;
@@ -307,9 +332,7 @@ impl RawClient<ElectrumSslStream> {
             .connect(&domain, stream)
             .map_err(Error::SslHandshakeError)?;
 
-        let client: Self = stream.into();
-        client.negotiate_protocol_version()?;
-        Ok(client)
+        Ok(stream.into())
     }
 }
 
@@ -391,9 +414,11 @@ impl RawClient<ElectrumSslStream> {
             validate_domain,
             timeout
         );
+
         if validate_domain {
             socket_addrs.domain().ok_or(Error::MissingDomain)?;
         }
+
         match timeout {
             Some(timeout) => {
                 let stream = connect_with_total_timeout(socket_addrs.clone(), timeout)?;
@@ -476,9 +501,7 @@ impl RawClient<ElectrumSslStream> {
         .map_err(Error::CouldNotCreateConnection)?;
         let stream = StreamOwned::new(session, tcp_stream);
 
-        let client: Self = stream.into();
-        client.negotiate_protocol_version()?;
-        Ok(client)
+        Ok(stream.into())
     }
 }
 
@@ -508,9 +531,7 @@ impl RawClient<ElectrumProxyStream> {
         stream.get_mut().set_read_timeout(timeout)?;
         stream.get_mut().set_write_timeout(timeout)?;
 
-        let client: Self = stream.into();
-        client.negotiate_protocol_version()?;
-        Ok(client)
+        Ok(stream.into())
     }
 
     #[cfg(all(
@@ -538,6 +559,7 @@ impl RawClient<ElectrumProxyStream> {
             )?,
             None => Socks5Stream::connect(&proxy.addr, target.clone(), timeout)?,
         };
+
         stream.get_mut().set_read_timeout(timeout)?;
         stream.get_mut().set_write_timeout(timeout)?;
 
@@ -560,15 +582,42 @@ impl<S: Read + Write> RawClient<S> {
     // `ClonableStream` before other threads can send a request to the server. They will block
     // waiting for the reader to release the mutex, but this will never happen because the server
     // didn't receive any request, so it has nothing to send back.
+    //
     // pub fn reader_thread(&self) -> Result<(), Error> {
     //     self._reader_thread(None).map(|_| ())
     // }
 
-    /// Negotiates the protocol version with the server.
+    /// Sets the [`AuthProvider`] for this client, enabling authentication on all
+    /// outgoing RPC requests.
+    ///
+    /// The `auth_provider` is a callback invoked before each request, allowing
+    /// dynamic token strategies such as automatic JWT refresh without
+    /// reconnecting the client. Passing `None` or not calling this method
+    /// disables authentication.
+    ///
+    /// # Notes
+    ///
+    /// This method should be called **before** [`RawClient::negotiate_protocol_version`],
+    /// as the initial `server.version` handshake also requires authentication
+    /// on protected servers.
+    pub fn with_auth(mut self, auth_provider: Option<AuthProvider>) -> Self {
+        self.auth_provider = auth_provider;
+        self
+    }
+
+    /// Negotiates the Electrum protocol version with the Electrum server.
     ///
     /// This sends `server.version` as the first message and stores the negotiated
-    /// protocol version. Called automatically by constructors.
-    fn negotiate_protocol_version(&self) -> Result<(), Error> {
+    /// protocol version.
+    ///
+    /// As of Electrum Protocol v1.6 it's a mandatory step, see:
+    /// <https://electrum-protocol.readthedocs.io/en/latest/protocol-changes.html#version-1-6>
+    ///
+    /// **NOTE:** It's only called automatically when building the client through [`ClientType`] constructors.
+    /// If you are building the client by [`RawClient`] constructors you MUST call this before any other request.
+    ///
+    /// [`ClientType`]: crate::ClientType
+    pub fn negotiate_protocol_version(self) -> Result<Self, Error> {
         let version_range = vec![
             PROTOCOL_VERSION_MIN.to_string(),
             PROTOCOL_VERSION_MAX.to_string(),
@@ -585,7 +634,7 @@ impl<S: Read + Write> RawClient<S> {
         let response: ServerVersionRes = serde_json::from_value(result)?;
 
         *self.protocol_version.lock()? = Some(response.protocol_version);
-        Ok(())
+        Ok(self)
     }
 
     fn _reader_thread(&self, until_message: Option<usize>) -> Result<serde_json::Value, Error> {
@@ -715,6 +764,14 @@ impl<S: Read + Write> RawClient<S> {
         let (sender, receiver) = channel();
         self.waiting_map.lock()?.insert(req.id, sender);
 
+        // apply `authorization` token into `Request`, if any.
+        let authorization = self
+            .auth_provider
+            .as_ref()
+            .and_then(|auth_provider| auth_provider());
+
+        let req = req.with_auth(authorization);
+
         let mut raw = serde_json::to_vec(&req)?;
         trace!("==> {}", String::from_utf8_lossy(&raw));
 
@@ -833,11 +890,20 @@ impl<T: Read + Write> ElectrumApi for RawClient<T> {
         // Add our listener to the map before we send the request
 
         for (method, params) in batch.iter() {
+            // if there's an `auth_provider` available, it should get the `authorization`, if any.
+            // it'll be set into into `Request`.
+            let authorization = self
+                .auth_provider
+                .as_ref()
+                .and_then(|auth_provider| auth_provider());
+
             let req = Request::new_id(
                 self.last_id.fetch_add(1, Ordering::SeqCst),
                 method,
                 params.to_vec(),
-            );
+            )
+            .with_auth(authorization);
+
             // Add distinct channel to each request so when we remove our request id (and sender) from the waiting_map
             // we can be sure that the response gets sent to the correct channel in self.recv
             let (sender, receiver) = channel();
@@ -1315,11 +1381,26 @@ mod test {
 
     use super::{ElectrumSslStream, RawClient};
     use crate::api::ElectrumApi;
+    use crate::config::AuthProvider;
+
+    // it's the default live testing electrum server, if you'd like to use a custom one set it up through
+    // the environment variable `TEST_ELECTRUM_SERVER`.
+    //
+    // here's an useful list of live servers: https://1209k.com/bitcoin-eye/ele.php.
+    const DEFAULT_TEST_ELECTRUM_SERVER: &str = "fortress.qtornado.com:443";
+
+    fn get_test_raw_client() -> RawClient<ElectrumSslStream> {
+        let server = std::env::var("TEST_ELECTRUM_SERVER")
+            .unwrap_or(DEFAULT_TEST_ELECTRUM_SERVER.to_owned());
+
+        RawClient::new_ssl(&*server, false, None)
+            .expect("should build the `RawClient` successfully!")
+    }
 
     fn get_test_client() -> RawClient<ElectrumSslStream> {
-        let server =
-            std::env::var("TEST_ELECTRUM_SERVER").unwrap_or("fortress.qtornado.com:443".into());
-        RawClient::new_ssl(&*server, false, None).unwrap()
+        get_test_raw_client()
+            .negotiate_protocol_version()
+            .expect("should negotiate `server.version` successfully!")
     }
 
     #[test]
@@ -1799,5 +1880,91 @@ mod test {
             000000000000000000000000000000000000000000000000000000000000000000\
             00000"
         )
+    }
+
+    #[test]
+    fn test_authorization_provider_with_client() {
+        use std::sync::{Arc, RwLock};
+
+        // Track how many times the provider is called
+        let call_count = Arc::new(RwLock::new(0));
+        let call_count_clone = call_count.clone();
+
+        let auth_provider = Arc::new(move || {
+            *call_count_clone.write().unwrap() += 1;
+            Some("Bearer test-token-123".to_string())
+        });
+
+        let client = get_test_raw_client()
+            .with_auth(Some(auth_provider))
+            .negotiate_protocol_version()
+            .expect("should negotiate `server.version` successfully!");
+
+        // Make a request - provider should be called
+        let _ = client.server_features();
+
+        // Provider should have been called at least once
+        assert!(*call_count.read().unwrap() >= 1);
+    }
+
+    #[test]
+    fn test_authorization_provider_dynamic_token_refresh() {
+        use std::sync::{Arc, RwLock};
+
+        // Simulate a token that can be refreshed
+        let token = Arc::new(RwLock::new("initial-token".to_string()));
+        let token_clone = token.clone();
+
+        let auth_provider: AuthProvider =
+            Arc::new(move || Some(token_clone.read().unwrap().clone()));
+
+        let client = get_test_raw_client()
+            .with_auth(Some(auth_provider.clone()))
+            .negotiate_protocol_version()
+            .expect("should negotiate `server.version` successfully!");
+
+        // Make first request with initial token
+        let _ = client.server_features();
+
+        // Simulate token refresh
+        *token.write().unwrap() = "refreshed-token".to_string();
+
+        // Make second request - should use the new token
+        let _ = client.server_features();
+
+        // Verify the provider now returns the refreshed token
+        assert_eq!(auth_provider(), Some("refreshed-token".to_string()));
+    }
+
+    #[test]
+    fn test_authorization_provider_returns_none() {
+        use std::sync::Arc;
+
+        let auth_provider: AuthProvider = Arc::new(|| None);
+
+        let client = get_test_raw_client()
+            .with_auth(Some(auth_provider))
+            .negotiate_protocol_version()
+            .expect("should negotiate `server.version` successfully!");
+
+        // Should still work when provider returns None
+        let result = client.server_features();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_auth_provider_via_constructor() {
+        use std::sync::Arc;
+
+        let auth_provider: AuthProvider = Arc::new(|| Some("Bearer test".to_string()));
+
+        let client = get_test_raw_client()
+            .with_auth(Some(auth_provider))
+            .negotiate_protocol_version()
+            .expect("should negotiate `server.version` successfully!");
+
+        // Verify the provider was set
+        let result = client.server_features();
+        assert!(result.is_ok());
     }
 }
