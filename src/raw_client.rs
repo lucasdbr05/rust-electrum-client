@@ -909,20 +909,30 @@ impl<T: Read + Write> ElectrumApi for RawClient<T> {
 
         // Add our listener to the map before we send the request
 
-        for (method, params) in batch.iter() {
-            // if there's an `auth_provider` available, it should get the `authorization`, if any.
-            // it'll be set into into `Request`.
-            let authorization = self
-                .auth_provider
-                .as_ref()
-                .and_then(|auth_provider| auth_provider());
-
-            let req = Request::new_id(
+        for (idx, (method, params)) in batch.iter().enumerate() {
+            let mut req = Request::new_id(
                 self.last_id.fetch_add(1, Ordering::SeqCst),
                 method,
                 params.to_vec(),
-            )
-            .with_auth(authorization);
+            );
+
+            // Although the library DOES NOT use JSON-RPC batch arrays,
+            // It applies the `authorization` ONLY in the first `Request` of the `Batch`.
+            //
+            // JWT tokens can be 1KB+, therefore duplicating it across multiple requests adds significant overhead.
+            // It assumes the server authenticates the `Batch` by the first `Request`. If a server implementation treats
+            // each newline-delimited request independently, subsequently `Request`'s would be unauthenticated.
+            //
+            // It's a known trade-off, not a bug.
+            if idx == 0 {
+                // it should get the `authorization`, if there's an `auth_provider` available.
+                let authorization = self
+                    .auth_provider
+                    .as_ref()
+                    .and_then(|auth_provider| auth_provider());
+
+                req = req.with_auth(authorization);
+            }
 
             // Add distinct channel to each request so when we remove our request id (and sender) from the waiting_map
             // we can be sure that the response gets sent to the correct channel in self.recv
