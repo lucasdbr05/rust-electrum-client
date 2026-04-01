@@ -112,26 +112,36 @@ impl ClientType {
     /// Constructor that supports multiple backends and allows configuration through
     /// the [Config]
     pub fn from_config(url: &str, config: &Config) -> Result<Self, Error> {
+        let auth_provider = config.authorization_provider().cloned();
+
         #[cfg(any(feature = "openssl", feature = "rustls", feature = "rustls-ring"))]
         if url.starts_with("ssl://") {
             let url = url.replacen("ssl://", "", 1);
             #[cfg(feature = "proxy")]
-            let client = match config.socks5() {
+            let raw_client = match config.socks5() {
                 Some(socks5) => RawClient::new_proxy_ssl(
                     url.as_str(),
                     config.validate_domain(),
                     socks5,
                     config.timeout(),
+                    auth_provider,
                 )?,
-                None => {
-                    RawClient::new_ssl(url.as_str(), config.validate_domain(), config.timeout())?
-                }
+                None => RawClient::new_ssl(
+                    url.as_str(),
+                    config.validate_domain(),
+                    config.timeout(),
+                    auth_provider,
+                )?,
             };
             #[cfg(not(feature = "proxy"))]
-            let client =
-                RawClient::new_ssl(url.as_str(), config.validate_domain(), config.timeout())?;
+            let raw_client = RawClient::new_ssl(
+                url.as_str(),
+                config.validate_domain(),
+                config.timeout(),
+                auth_provider,
+            )?;
 
-            return Ok(ClientType::SSL(client));
+            return Ok(ClientType::SSL(raw_client));
         }
 
         #[cfg(not(any(feature = "openssl", feature = "rustls", feature = "rustls-ring")))]
@@ -143,18 +153,28 @@ impl ClientType {
 
         {
             let url = url.replacen("tcp://", "", 1);
+
             #[cfg(feature = "proxy")]
             let client = match config.socks5() {
                 Some(socks5) => ClientType::Socks5(RawClient::new_proxy(
                     url.as_str(),
                     socks5,
                     config.timeout(),
+                    auth_provider,
                 )?),
-                None => ClientType::TCP(RawClient::new(url.as_str(), config.timeout())?),
+                None => ClientType::TCP(RawClient::new(
+                    url.as_str(),
+                    config.timeout(),
+                    auth_provider,
+                )?),
             };
 
             #[cfg(not(feature = "proxy"))]
-            let client = ClientType::TCP(RawClient::new(url.as_str(), config.timeout())?);
+            let client = ClientType::TCP(RawClient::new(
+                url.as_str(),
+                config.timeout(),
+                auth_provider,
+            )?);
 
             Ok(client)
         }
