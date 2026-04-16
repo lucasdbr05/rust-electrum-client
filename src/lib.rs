@@ -52,6 +52,8 @@ mod config;
 
 pub mod raw_client;
 mod stream;
+#[cfg(feature = "tofu")]
+mod tofu;
 mod types;
 pub mod utils;
 
@@ -59,4 +61,6 @@ pub use api::ElectrumApi;
 pub use batch::Batch;
 pub use client::*;
 pub use config::{AuthProvider, Config, ConfigBuilder, Socks5Config};
+#[cfg(feature = "tofu")]
+pub use tofu::TofuStore;
 pub use types::*;
