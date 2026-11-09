@@ -449,6 +449,8 @@ mod danger {
     use std::sync::Arc;
     #[cfg(feature = "tofu")]
     use crate::tofu::TofuStore;
+    #[cfg(feature = "tofu")]
+    use rustls::crypto::WebPkiSupportedAlgorithms;
 
     #[derive(Debug)]
     pub struct NoCertificateVerification(CryptoProvider);
@@ -501,6 +503,7 @@ mod danger {
         inner: Arc<dyn ServerCertVerifier>,
         host: String,
         tofu_store: Arc<dyn TofuStore>,
+        signature_algorithms: WebPkiSupportedAlgorithms,
     }
 
     #[cfg(feature = "tofu")]
@@ -509,11 +512,13 @@ mod danger {
             inner: Arc<dyn ServerCertVerifier>,
             host: String,
             tofu_store: Arc<dyn TofuStore>,
+            signature_algorithms: WebPkiSupportedAlgorithms,
         ) -> Self {
             Self {
                 inner,
                 host,
                 tofu_store,
+                signature_algorithms,
             }
         }
 
@@ -558,13 +563,16 @@ mod danger {
             Ok(ServerCertVerified::assertion())
         }
 
+        // The handshake signatures are checked here rather than by `inner`: when
+        // `inner` is `NoCertificateVerification` it accepts any signature, and a
+        // server must prove it holds the key of the certificate TOFU trusts.
         fn verify_tls12_signature(
             &self,
             message: &[u8],
             cert: &CertificateDer<'_>,
             dss: &DigitallySignedStruct,
         ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            self.inner.verify_tls12_signature(message, cert, dss)
+            rustls::crypto::verify_tls12_signature(message, cert, dss, &self.signature_algorithms)
         }
 
         fn verify_tls13_signature(
@@ -573,11 +581,141 @@ mod danger {
             cert: &CertificateDer<'_>,
             dss: &DigitallySignedStruct,
         ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            self.inner.verify_tls13_signature(message, cert, dss)
+            rustls::crypto::verify_tls13_signature(message, cert, dss, &self.signature_algorithms)
         }
 
         fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            self.inner.supported_verify_schemes()
+            self.signature_algorithms.supported_schemes()
+        }
+    }
+
+    #[cfg(all(test, feature = "tofu"))]
+    mod tofu_verifier_tests {
+        use super::*;
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::PrivateKeyDer;
+        use rustls::server::{ClientHello, ResolvesServerCert};
+        use rustls::sign::CertifiedKey;
+        use rustls::{ClientConfig, ClientConnection, ServerConfig, ServerConnection};
+        use rustls::{SupportedProtocolVersion, ALL_VERSIONS};
+
+        const HOST: &str = "electrum.example";
+        const CERT: &[u8] = include_bytes!("tofu/test_data/cert.pem");
+        const KEY: &[u8] = include_bytes!("tofu/test_data/key.pem");
+        const OTHER_KEY: &[u8] = include_bytes!("tofu/test_data/other_key.pem");
+
+        /// A store that already trusts `CERT`, as after a first connection.
+        #[derive(Debug)]
+        struct TrustedStore;
+
+        impl TofuStore for TrustedStore {
+            fn get_certificate(&self, _host: &str) -> std::io::Result<Option<Vec<u8>>> {
+                Ok(Some(cert().to_vec()))
+            }
+
+            fn set_certificate(&self, _host: &str, _cert: Vec<u8>) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// Presents `CERT` and signs with the given key, whether or not they match.
+        #[derive(Debug)]
+        struct FixedCert(Arc<CertifiedKey>);
+
+        impl ResolvesServerCert for FixedCert {
+            fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+                Some(self.0.clone())
+            }
+        }
+
+        fn provider() -> Arc<CryptoProvider> {
+            #[cfg(feature = "rustls-ring")]
+            let provider = rustls::crypto::ring::default_provider();
+            #[cfg(not(feature = "rustls-ring"))]
+            let provider = rustls::crypto::aws_lc_rs::default_provider();
+            Arc::new(provider)
+        }
+
+        fn cert() -> CertificateDer<'static> {
+            CertificateDer::from_pem_slice(CERT).unwrap()
+        }
+
+        /// Runs a handshake against a server that presents `CERT` and signs with `key`.
+        fn handshake(
+            version: &'static SupportedProtocolVersion,
+            key: &[u8],
+        ) -> Result<(), rustls::Error> {
+            let provider = provider();
+            let signing_key = provider
+                .key_provider
+                .load_private_key(PrivateKeyDer::from_pem_slice(key).unwrap())
+                .unwrap();
+            let server_config = ServerConfig::builder_with_provider(provider.clone())
+                .with_protocol_versions(&[version])
+                .unwrap()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(FixedCert(Arc::new(CertifiedKey::new(
+                    vec![cert()],
+                    signing_key,
+                )))));
+
+            let verifier = TofuVerifier::new(
+                Arc::new(NoCertificateVerification::new((*provider).clone())),
+                HOST.to_string(),
+                Arc::new(TrustedStore),
+                provider.signature_verification_algorithms,
+            );
+            let client_config = ClientConfig::builder_with_provider(provider)
+                .with_protocol_versions(&[version])
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(verifier))
+                .with_no_client_auth();
+
+            let mut client =
+                ClientConnection::new(Arc::new(client_config), HOST.try_into().unwrap()).unwrap();
+            let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
+
+            while client.is_handshaking() || server.is_handshaking() {
+                let mut progressed = false;
+                if client.wants_write() {
+                    let mut buf = Vec::new();
+                    client.write_tls(&mut buf).unwrap();
+                    server.read_tls(&mut buf.as_slice()).unwrap();
+                    server.process_new_packets()?;
+                    progressed = true;
+                }
+                if server.wants_write() {
+                    let mut buf = Vec::new();
+                    server.write_tls(&mut buf).unwrap();
+                    client.read_tls(&mut buf.as_slice()).unwrap();
+                    client.process_new_packets()?;
+                    progressed = true;
+                }
+                assert!(progressed, "handshake stalled");
+            }
+
+            Ok(())
+        }
+
+        #[test]
+        fn accepts_trusted_certificate_from_its_key_holder() {
+            for version in ALL_VERSIONS {
+                assert!(handshake(version, KEY).is_ok(), "{version:?}");
+            }
+        }
+
+        #[test]
+        fn rejects_trusted_certificate_signed_with_another_key() {
+            for version in ALL_VERSIONS {
+                assert!(
+                    matches!(
+                        handshake(version, OTHER_KEY),
+                        Err(rustls::Error::InvalidCertificate(_))
+                    ),
+                    "{version:?}"
+                );
+            }
         }
     }
 }
@@ -767,6 +905,7 @@ impl RawClient<ElectrumSslStream> {
         }
 
         let builder = ClientConfig::builder();
+        let signature_algorithms = builder.crypto_provider().signature_verification_algorithms;
         let domain = socket_addr
             .domain()
             .ok_or(Error::MissingDomain)?
@@ -799,6 +938,7 @@ impl RawClient<ElectrumSslStream> {
             inner_verifier,
             domain.clone(),
             tofu_store,
+            signature_algorithms,
         );
 
         let config: ClientConfig = builder
